@@ -2,29 +2,55 @@
     "routes": [
         {
             "route_id": 1,
-            "name": "Rota 1: Fundo -> Viaduto Direita",
-            "gate_a": [
-                [340, 420],
-                [710, 470]
+            "name": "Rota 1: Fundo -> CAM1 (Direita)",
+            "color": [
+                0,
+                255,
+                255
             ],
-            "gate_b": [
-                [670, 520],
-                [1279, 660]
+            "path_points": [
+                [
+                    425,
+                    295
+                ],
+                [
+                    585,
+                    420
+                ],
+                [
+                    770,
+                    555
+                ],
+                [
+                    1060,
+                    675
+                ]
             ],
-            "color": [0, 255, 255]
+            "corridor_width": 1.0
         },
         {
             "route_id": 2,
-            "name": "Rota 2: Fundo -> Seguir Reto",
-            "gate_a": [
-                [340, 420],
-                [710, 470]
+            "name": "Rota 2: Via Distante (Direita -> Fundo)",
+            "color": [
+                255,
+                160,
+                0
             ],
-            "gate_b": [
-                [180, 680],
-                [660, 715]
+            "path_points": [
+                [
+                    1265,
+                    395
+                ],
+                [
+                    1120,
+                    355
+                ],
+                [
+                    955,
+                    325
+                ]
             ],
-            "color": [255, 0, 128]
+            "corridor_width": 0.85
         }
     ]
 }

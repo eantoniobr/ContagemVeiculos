@@ -13,6 +13,11 @@ __pycache__/
 *.png
 test_routes.json
 
+# Modelos compilados ONNX e pesos pesados
+*.onnx
+yolo11m.pt
+yolo11l.pt
+
 # IDEs e editores
 .idea/
 .vscode/

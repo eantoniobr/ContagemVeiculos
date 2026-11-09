@@ -1,23 +1,30 @@
 # Sistema Inteligente de Contagem de Veículos por Rota
 
-Sistema de visão computacional e inteligência artificial para detecção, rastreamento contínuo e contagem classificada de veículos por rotas e faixas em vias públicas e viadutos.
+Sistema de visão computacional e inteligência artificial para detecção, rastreamento contínuo e contagem classificada de veículos por percursos direcionais e faixas em vias públicas e viadutos.
 
 ## 🚀 Principais Funcionalidades
 
-- **Detecção e Rastreamento em Tempo Real:** Utiliza modelos YOLO11 (YOLO11s / YOLO11n) integrados ao algoritmo ByteTrack para manter IDs estáveis mesmo sob oclusões parciais e postes.
-- **Lógica de Portais Duplos (Gate A → Gate B):** Permite isolar com precisão os veículos que executam manobras específicas (ex: conversão sob viaduto vs. seguir reto), prevenindo contagens duplicadas e ignorando tráfego no sentido oposto.
-- **Suporte a Vias Largas e Multi-Faixas:** Algoritmo calibrado e robusto contra variações laterais, garantindo que veículos em qualquer faixa da via sejam contabilizados com precisão.
-- **Classificação Automática por Categorias:**
-  - 🚗 Carros
+- **Detecção e Rastreamento em Tempo Real:** Utiliza modelos YOLO11 (YOLO11s Fluido ~40 FPS / YOLO11m / YOLO11l / YOLO11n) em resolução nativa 16:9 HD (`1280x736`) acelerados por GPU DirectML (NVIDIA GeForce RTX, AMD Radeon, Intel Iris).
+- **Percurso Único Direcional (Início ➔ Fim em 1 Única Etapa):**
+  - Definição simplificada e intuitiva: basta clicar ou arrastar o mouse acompanhando a via de onde os veículos vêm (`[INÍCIO]`) até para onde vão (`[FIM]`).
+  - **Setas Direcionais Automáticas (`➔ ➔ ➔`):** Mostram claramente o sentido válido do fluxo. Veículos na contramão ou atravessando transversalmente de outras ruas são automaticamente ignorados.
+  - **Faixa de Corredor com Largura Ajustável:** Botões dedicados `[➖ Mais Fina]` e `[➕ Mais Larga]` em cada card de percurso para calibrar a espessura ideal de qualquer via (curta, longa, estreita ou larga).
+- **Rastreamento Cinemático Stride-Aware (Alta Velocidade):**
+  - Projeção de velocidade vetorial ($\hat{P} = P + \vec{v} \cdot \Delta t$) e interpolação automática, preservando a identidade dos veículos em altas velocidades (`2x`, `3x`, `4x`, `8x`, `10x`, `20x`, `50x`, `100x` e `Turbo`) sem perda de contagem.
+- **Tolerância a Semáforos e Oclusões:** Detecta perfeitamente veículos que aguardavam sinal fechado ou que passaram temporariamente atrás de pilares de viadutos.
+- **Classificação Automática por Categorias (Ordem de Relevância):**
   - 🏍️ Motos (motocicletas e ciclomotores)
-  - 🚚 Caminhões
-  - 🚌 Ônibus
-- **Interface Gráfica Completa (Tkinter):**
-  - Reprodução de vídeo em alta fluidez (multi-threaded).
-  - Desenho interativo de novas rotas diretamente sobre o vídeo.
-  - Seleção de velocidade (0.5x, 1.0x, 2.0x, Modo Turbo).
-  - Painel de estatísticas individuais por rota e totalizador consolidado.
-  - Persistência automática das configurações em JSON.
+  - 🚗 Carros (veículos de passeio)
+  - 🚚 Caminhões (cargas e pesados)
+  - 🚌 Ônibus (coletivos e vans)
+- **Linha do Tempo Interativa (Timeline Scrubber) com Dedução Automática (Rollback):**
+  - Navegue livremente por qualquer instante do vídeo.
+  - Ao retroceder, os veículos contabilizados no intervalo são **automaticamente descontados** e seus IDs são liberados para nova contagem.
+  - Botões de salto rápido: `[ ⏪ -30s ]`, `[ ◀◀ -10s ]`, `[ ◀ -5s ]`, `[ ◂ -1s ]`, `[ +1s ▸ ]`, `[ +5s ▶ ]`, `[ +10s ▶▶ ]`, `[ +30s ⏩ ]`.
+  - Atalhos de teclado: `Seta Esquerda (◀)` retrocede 5s, `Seta Direita (▶)` avança 5s, e `Barra de Espaço` pausa/retoma.
+- **Interface Gráfica Interativa (Tkinter/Canvas):**
+  - Fila desacoplada não-bloqueante para reprodução ultra-fluida.
+  - Totalizador consolidado e painel de estatísticas individuais por percurso.
 
 ## 📁 Estrutura do Projeto
 
@@ -25,12 +32,12 @@ Sistema de visão computacional e inteligência artificial para detecção, rast
 ContagemVeiculos/
 ├── core/
 │   ├── config_manager.py     # Gerenciamento e persistência das rotas em JSON
-│   ├── detector_tracker.py   # Pipeline YOLO11 + ByteTrack
-│   └── route_engine.py       # Lógica matemática de cruzamento de portais e contagem
+│   ├── detector_tracker.py   # Pipeline YOLO11 HD + Rastreador Cinemático Híbrido GPU DirectML
+│   └── route_engine.py       # Lógica matemática de percursos direcionais e validação vetorial
 ├── ui/
-│   └── app_window.py         # Interface visual gráfica interativa (Tkinter/Canvas)
-├── custom_tracker.yaml       # Calibração fina do rastreador ByteTrack
-├── routes_config.json        # Configuração das coordenadas das rotas ativas
+│   └── app_window.py         # Interface gráfica interativa (Tkinter/Canvas)
+├── custom_tracker.yaml       # Calibração fina do rastreador
+├── routes_config.json        # Configuração das coordenadas e larguras dos percursos ativos
 ├── Executar.bat              # Script facilitador de inicialização no Windows
 ├── main.py                   # Ponto de entrada da aplicação
 ├── test_system.py            # Testes automatizados unitários e de integração
@@ -43,22 +50,23 @@ ContagemVeiculos/
 - Python 3.10 ou superior
 - Dependências instaladas:
   ```bash
-  pip install ultralytics opencv-python pillow
+  pip install ultralytics opencv-python pillow torch onnx onnxruntime-directml
   ```
 
 ### 2. Inicialização Rápida
-Basta dar um duplo clique no arquivo:
+Dê um duplo clique no arquivo:
 ```cmd
 Executar.bat
 ```
-Ou executar via terminal:
+Ou execute via terminal:
 ```bash
 python main.py
 ```
 
-## ⚙️ Configuração de Rotas
+## ⚙️ Configuração de Percursos
 
-As coordenadas das rotas podem ser desenhadas diretamente pela interface através do botão **"+ Desenhar Nova Rota"** ou configuradas no arquivo `routes_config.json`.
-Cada rota define:
-- **Linha de Entrada (Gate A):** Linha transversal por onde os veículos entram na via de interesse.
-- **Linha de Saída (Gate B):** Linha transversal que confirma a rota realizada (ex: alça do viaduto ou continuação em linha reta).
+1. Clique no botão **`★ + Novo Percurso (Início ➔ Fim)`**.
+2. Digite um nome para o percurso (ex: `Rota 1: Fundo -> CAM1`).
+3. Clique ou arraste no vídeo acompanhando a via de onde os veículos surgem até onde eles saem.
+4. Pressione **Enter**, clique com o **botão direito** ou no botão **`✓ Concluir Percurso`**.
+5. No card lateral da rota, ajuste a espessura da faixa com **`[➖ Mais Fina]`** ou **`[➕ Mais Larga]`** se necessário.
