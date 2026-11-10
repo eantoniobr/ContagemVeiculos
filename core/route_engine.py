@@ -711,11 +711,11 @@ class RouteEngine:
                 route.vehicle_states[track_id]["category"] = category
             return
 
-        # Limiares flexíveis adaptados ao comprimento do percurso (vias curtas vs longas)
+        # Limiares estritos: O veículo DEVE vir da região inicial (Origem) e percorrer o caminho até o fim
         is_short_route = (total_len < 200.0)
-        s_entry_threshold = 0.62 if is_short_route else 0.56
-        s_exit_threshold = 0.58 if is_short_route else 0.66
-        min_progress = 0.16 if is_short_route else 0.22
+        s_entry_threshold = 0.40 if is_short_route else 0.35
+        s_exit_threshold = 0.70 if is_short_route else 0.75
+        min_progress = 0.35 if is_short_route else 0.40
 
         if track_id not in route.vehicle_states:
             s_earliest = s_curr
@@ -725,7 +725,7 @@ class RouteEngine:
                     s_t, d_t, cp_t, _, _ = project_point_to_path(tp, route.path_points)
                     w_t = route.get_width_at_s(s_t)
                     hw_t = perspective_half_width(cp_t[1], w_t)
-                    if d_t <= hw_t * 1.30 and s_t < s_earliest:
+                    if d_t <= hw_t * 1.25 and s_t < s_earliest:
                         s_earliest = s_t
                         earliest_pos = tp
 
@@ -739,11 +739,13 @@ class RouteEngine:
                 "s_last": s_curr,
                 "start_pos": earliest_pos,
                 "last_pos": ref_pt,
+                "frames_in_corridor": 1,
             }
         else:
             st = route.vehicle_states[track_id]
             st["last_frame"] = frame_idx
             st["category"] = category
+            st["frames_in_corridor"] = st.get("frames_in_corridor", 1) + 1
             if s_curr < st["s_min"] and (st["s_last"] - s_curr) < 0.08:
                 st["s_min"] = s_curr
             if s_curr > st["s_max"]:
@@ -753,8 +755,8 @@ class RouteEngine:
 
         st = route.vehicle_states[track_id]
 
-        # Herança de estado para troca de ID no meio da faixa (oclusão temporária por pilares)
-        if st["s_min"] > s_entry_threshold and s_curr >= 0.40:
+        # Herança estrita de estado apenas para brevíssimas oclusões (ex: postes/placas no mesmo sentido)
+        if st["s_min"] > s_entry_threshold and s_curr < 0.65:
             best_orphan_id = None
             best_orphan_s = -1.0
             for cand_id, cand_st in list(route.vehicle_states.items()):
@@ -762,62 +764,79 @@ class RouteEngine:
                     continue
                 if cand_st.get("s_min", 1.0) > s_entry_threshold:
                     continue
-                if cand_st.get("s_last", 1.0) >= s_curr - 0.04:
+                # Órfão só pode ser herdado se foi visto recentemente (máximo 35 quadros ~ 1.1s)
+                dt_f = frame_idx - cand_st.get("last_frame", 0)
+                if not (1 <= dt_f <= 35):
+                    continue
+                # Órfão deve ter categoria compatível
+                cand_cat = cand_st.get("category")
+                if cand_cat != category:
+                    if not (cand_cat in ("Carro", "Ônibus", "Caminhão") and category in ("Carro", "Ônibus", "Caminhão")):
+                        continue
+                # Deve estar próximo longitudinalmente ao ponto onde o órfão foi visto
+                s_diff = s_curr - cand_st.get("s_last", 0.0)
+                if not (0.01 <= s_diff <= 0.18):
                     continue
 
-                dt_f = frame_idx - cand_st.get("last_frame", 0)
-                max_dt = 2400 if cand_st.get("s_last", 0) < 0.50 else 240
-                if 1 <= dt_f <= max_dt:
-                    ox, oy = cand_st["last_pos"]
-                    vx, vy = ref_pt[0] - ox, ref_pt[1] - oy
-                    v_norm = math.hypot(vx, vy)
-                    if v_norm > 6.0:
-                        cos_align = (vx * tan_vec[0] + vy * tan_vec[1]) / v_norm
-                        if cos_align >= 0.40 and cand_st["s_last"] > best_orphan_s:
-                            best_orphan_s = cand_st["s_last"]
-                            best_orphan_id = cand_id
+                ox, oy = cand_st["last_pos"]
+                vx, vy = ref_pt[0] - ox, ref_pt[1] - oy
+                v_norm = math.hypot(vx, vy)
+                if 6.0 <= v_norm <= 140.0:
+                    cos_align = (vx * tan_vec[0] + vy * tan_vec[1]) / v_norm
+                    if cos_align >= 0.70 and cand_st["s_last"] > best_orphan_s:
+                        best_orphan_s = cand_st["s_last"]
+                        best_orphan_id = cand_id
 
             if best_orphan_id is not None:
                 orphan = route.vehicle_states.pop(best_orphan_id)
                 st["s_min"] = orphan["s_min"]
                 st["start_pos"] = orphan["start_pos"]
                 st["frame"] = orphan["frame"]
+                st["frames_in_corridor"] = st.get("frames_in_corridor", 1) + orphan.get("frames_in_corridor", 1)
 
         # ======================================================================
         # VALIDAÇÃO DE CONCLUSÃO DO PERCURSO NA DIREÇÃO CORRETA (INÍCIO -> FIM)
         # ======================================================================
-        # 1. Deve ter alcançado a zona final do percurso
+        # 1. Deve ter alcançado a zona final do percurso (Destino)
         if s_curr < s_exit_threshold or d_perp > (hw * 1.15):
             return
 
-        # 2. Deve ter entrado na metade inicial do percurso (Origem / Início)
+        # 2. OBRIGATÓRIO: Deve ter vindo do início do percurso (s_min <= s_entry_threshold)
+        # Impede 100% que veículos que entraram da lateral ou do meio contem!
         if st["s_min"] > s_entry_threshold:
             return
 
-        # 3. Deve ter percorrido avanço positivo
+        # 3. Deve ter percorrido avanço longitudinal real ao longo da rota
         delta_s = s_curr - st["s_min"]
         if delta_s < min_progress:
             return
 
-        # 4. Validação estrita do sentido (impede 100% contramão Fim -> Início e tráfego transversal)
+        # 4. Deve ter permanecido tempo suficiente no percurso (rejeita cortes transversais rápidos)
+        if st.get("frames_in_corridor", 1) < 3:
+            return
+
+        # 5. Validação rigorosa do sentido de deslocamento (impede tráfego transversal e contramão)
         sx, sy = st["start_pos"]
         jx, jy = ref_pt[0] - sx, ref_pt[1] - sy
         j_len = math.hypot(jx, jy)
-        min_journey_px = max(12.0, total_len * 0.15)
+        min_journey_px = max(20.0, total_len * 0.35)
         if j_len < min_journey_px:
             return
 
-        p_start = route.path_points[0]
-        p_end = route.path_points[-1]
-        gx, gy = p_end[0] - p_start[0], p_end[1] - p_start[1]
-        g_len = max(1.0, math.hypot(gx, gy))
-        g_tan = (gx / g_len, gy / g_len)
+        # Decomposição em avanço longitudinal (ao longo da via) e desvio transversal (atravessando a via)
+        j_longitudinal = jx * tan_vec[0] + jy * tan_vec[1]
+        j_transversal = abs(-jx * tan_vec[1] + jy * tan_vec[0])
 
-        cos_global = (jx * g_tan[0] + jy * g_tan[1]) / j_len
-        cos_local_journey = (jx * tan_vec[0] + jy * tan_vec[1]) / j_len
-        if max(cos_global, cos_local_journey) < 0.35:
+        # O veículo deve se mover substancialmente no sentido do percurso (cos >= 0.65)
+        cos_journey = j_longitudinal / j_len
+        if cos_journey < 0.65:
             return
 
+        # O avanço longitudinal deve ser predominante sobre o movimento lateral (impede cortar de lado)
+        if j_longitudinal < (1.6 * j_transversal):
+            return
+
+        # 6. Alinhamento vetorial da trajetória recente (últimos frames do rastro)
         if trail and len(trail) >= 2:
             k_back = min(len(trail), 8)
             lx = trail[-1][0] - trail[-k_back][0]
@@ -825,10 +844,10 @@ class RouteEngine:
             l_len = math.hypot(lx, ly)
             if l_len > 5.0:
                 cos_recent = (lx * tan_vec[0] + ly * tan_vec[1]) / l_len
-                if cos_recent < 0.20:
+                if cos_recent < 0.60:
                     return
 
-        # 5. Desduplicação espacial
+        # 7. Desduplicação espacial para não duplicar contagem no mesmo instante
         cx, cy = center_pt
         for old_frame, old_pos, old_cat in route.recent_completions:
             dt = frame_idx - old_frame
@@ -870,7 +889,7 @@ class RouteEngine:
         for route in self.routes:
             expired_keys = [
                 tid for tid, s in route.vehicle_states.items()
-                if (frame_idx - s.get("last_frame", s.get("last_seen_in_a", s.get("frame", 0)))) > 3000
+                if (frame_idx - s.get("last_frame", s.get("last_seen_in_a", s.get("frame", 0)))) > 45
             ]
             for ek in expired_keys:
                 del route.vehicle_states[ek]

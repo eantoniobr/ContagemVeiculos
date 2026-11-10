@@ -170,9 +170,41 @@ def test_single_directional_path():
         }], frame_idx=10 + idx)
         counted += len(evs)
 
-    assert counted == 1, f"Veículo no sentido correto (A -> B) deveria ser contado 1x, contou {counted}!"
-    assert r.counts["Moto"] == 1, "Deveria ter contado 1 Moto no percurso único!"
-    print(" -> Percurso Único Direcional OK (Sentido A -> B contado e sentido B -> A bloqueado)!")
+    # 3. Veículo da lateral cortando quase no ponto final (NUNCA DEVE CONTAR!)
+    # Ponto final está em (500, 600). Caminhão corta transversalmente de (600, 520) para (420, 640)
+    for idx, (px, py) in enumerate([(580, 530), (530, 570), (480, 600), (440, 630)]):
+        evs = engine.update([{
+            "id": 99,
+            "bbox": (px - 30, py - 30, px + 30, py + 30),
+            "prev_bbox": (px - 30, py - 30, px + 30, py + 30),
+            "center": (px, py),
+            "ground_point": (px, py),
+            "prev_point": (px, py),
+            "category": "Caminhão",
+            "confidence": 0.95,
+            "trail": [(580, 530), (px, py)],
+        }], frame_idx=25 + idx)
+        assert len(evs) == 0, "Caminhão vindo da lateral cortando o final NÃO pode ser contabilizado!"
+
+    # 4. Veículo que surge no meio do percurso (s = 0.60) sem vir do início (NUNCA DEVE CONTAR!)
+    for idx, (px, py) in enumerate([(340, 480), (400, 525), (480, 585)]):
+        evs = engine.update([{
+            "id": 105,
+            "bbox": (px - 20, py - 20, px + 20, py + 20),
+            "prev_bbox": (px - 20, py - 20, px + 20, py + 20),
+            "center": (px, py),
+            "ground_point": (px, py),
+            "prev_point": (px, py),
+            "category": "Carro",
+            "confidence": 0.93,
+            "trail": [(340, 480), (px, py)],
+        }], frame_idx=35 + idx)
+        assert len(evs) == 0, "Veículo que entrou pelo meio da rota sem vir da origem NÃO pode ser contado!"
+
+    assert r.counts["Moto"] == 1, "Apenas a Moto legítima deve ter sido contada!"
+    assert r.counts["Caminhão"] == 0, "Caminhão lateral não deve ser contado!"
+    assert r.counts["Carro"] == 0, "Carro que entrou no meio não deve ser contado!"
+    print(" -> Percurso Único Direcional OK (Sentido A -> B contado, contramão bloqueada e tráfego lateral 100% rejeitado)!")
 
 
 def test_timeline_rollback():
@@ -303,14 +335,15 @@ def test_video_dav_processing():
     all_tracked = []
     events_captured = []
 
-    # Inicia no frame 1260 onde o fluxo da Origem A avança para o Destino B
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 1260)
+    # Inicia no frame 1210 para capturar o fluxo de veículos vindo da Origem até o Destino
+    start_f = 1210
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
 
-    for i in range(70):
+    for i in range(110):
         ret, frame = cap.read()
         if not ret:
             break
-        curr_frame = 1260 + i
+        curr_frame = start_f + i
         tracked = detector.process_frame(frame)
         evs = engine.update(tracked, curr_frame)
         if evs:
