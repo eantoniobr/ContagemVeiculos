@@ -98,29 +98,92 @@ def resample_polyline(points, step_px=28.0):
     return out
 
 
-def build_corridor_polygon(path_points, width_scale=1.0):
+def resample_path_with_widths(path_points, point_widths=None, default_width=1.0, step_px=25.0):
+    """
+    Reamostra uma polilinha direcional mantendo e interpolando a largura definida para cada ponto.
+    Retorna uma lista de tuplas (px, py, pw).
+    """
+    if not path_points or len(path_points) < 2:
+        if not path_points:
+            return []
+        w0 = point_widths[0] if (point_widths and len(point_widths) > 0) else default_width
+        return [(int(round(path_points[0][0])), int(round(path_points[0][1])), float(w0))]
+
+    n_pts = len(path_points)
+    widths = []
+    for i in range(n_pts):
+        if point_widths is not None and i < len(point_widths):
+            widths.append(float(point_widths[i]))
+        else:
+            widths.append(float(default_width))
+
+    cleaned_pts = [tuple(map(float, path_points[0]))]
+    cleaned_w = [widths[0]]
+    for i in range(1, n_pts):
+        pt = tuple(map(float, path_points[i]))
+        last = cleaned_pts[-1]
+        dist = math.hypot(pt[0] - last[0], pt[1] - last[1])
+        if dist >= 2.0:
+            cleaned_pts.append(pt)
+            cleaned_w.append(widths[i])
+        else:
+            cleaned_w[-1] = widths[i]
+
+    if len(cleaned_pts) < 2:
+        p0 = cleaned_pts[0]
+        cleaned_pts.append((p0[0] + 10.0, p0[1] + 10.0))
+        cleaned_w.append(cleaned_w[0])
+
+    sampled = [(int(round(cleaned_pts[0][0])), int(round(cleaned_pts[0][1])), float(cleaned_w[0]))]
+
+    for i in range(len(cleaned_pts) - 1):
+        ax, ay = cleaned_pts[i]
+        bx, by = cleaned_pts[i + 1]
+        wa = cleaned_w[i]
+        wb = cleaned_w[i + 1]
+        seg_len = math.hypot(bx - ax, by - ay)
+        n_steps = max(1, int(seg_len // step_px))
+
+        for s in range(1, n_steps + 1):
+            frac = s / float(n_steps)
+            px = int(round(ax + (bx - ax) * frac))
+            py = int(round(ay + (by - ay) * frac))
+            pw = float(wa + (wb - wa) * frac)
+            if (px, py) != (sampled[-1][0], sampled[-1][1]):
+                sampled.append((px, py, pw))
+
+    return sampled
+
+
+def build_corridor_polygon(path_points, width_scale=1.0, point_widths=None):
     """
     Constrói o polígono de faixa (corredor) ao redor do percurso direcional
-    (Início -> Fim) com largura calibrada por perspectiva.
+    (Início -> Fim) com calibração de perspectiva e suporte a larguras variáveis por ponto.
     """
-    pts = resample_polyline(path_points, step_px=25.0)
-    if len(pts) < 2:
+    sampled = resample_path_with_widths(
+        path_points,
+        point_widths=point_widths,
+        default_width=width_scale,
+        step_px=25.0,
+    )
+    if len(sampled) < 2:
         return []
 
     left_side = []
     right_side = []
-    n = len(pts)
+    n = len(sampled)
 
     for i in range(n):
+        px, py, pw = sampled[i]
         if i == 0:
-            dx = pts[1][0] - pts[0][0]
-            dy = pts[1][1] - pts[0][1]
+            dx = sampled[1][0] - sampled[0][0]
+            dy = sampled[1][1] - sampled[0][1]
         elif i == n - 1:
-            dx = pts[-1][0] - pts[-2][0]
-            dy = pts[-1][1] - pts[-2][1]
+            dx = sampled[-1][0] - sampled[-2][0]
+            dy = sampled[-1][1] - sampled[-2][1]
         else:
-            dx = pts[i + 1][0] - pts[i - 1][0]
-            dy = pts[i + 1][1] - pts[i - 1][1]
+            dx = sampled[i + 1][0] - sampled[i - 1][0]
+            dy = sampled[i + 1][1] - sampled[i - 1][1]
 
         norm = math.hypot(dx, dy)
         if norm < 1e-5:
@@ -129,12 +192,12 @@ def build_corridor_polygon(path_points, width_scale=1.0):
             tx, ty = dx / norm, dy / norm
 
         nx, ny = -ty, tx
-        hw = perspective_half_width(pts[i][1], width_scale)
+        hw = perspective_half_width(py, custom_scale=pw)
 
-        lx = int(round(pts[i][0] + nx * hw))
-        ly = int(round(pts[i][1] + ny * hw))
-        rx = int(round(pts[i][0] - nx * hw))
-        ry = int(round(pts[i][1] - ny * hw))
+        lx = int(round(px + nx * hw))
+        ly = int(round(py + ny * hw))
+        rx = int(round(px - nx * hw))
+        ry = int(round(py - ny * hw))
 
         left_side.append((lx, ly))
         right_side.append((rx, ry))
@@ -324,6 +387,7 @@ class Route:
         name,
         path_points=None,
         corridor_width=1.0,
+        point_widths=None,
         polygon_a=None,
         polygon_b=None,
         gate_a=None,
@@ -340,7 +404,22 @@ class Route:
         # Percurso Único Direcional (Início -> Fim)
         self.path_points = [tuple(map(int, p)) for p in path_points] if path_points and len(path_points) >= 2 else None
 
+        # Larguras individuais de cada ponto do percurso (calibração por ponto)
+        if point_widths:
+            self.point_widths = [float(w) for w in point_widths]
+        elif self.path_points:
+            self.point_widths = [self.corridor_width] * len(self.path_points)
+        else:
+            self.point_widths = []
+
+        if self.path_points:
+            if len(self.point_widths) < len(self.path_points):
+                self.point_widths += [self.corridor_width] * (len(self.path_points) - len(self.point_widths))
+            elif len(self.point_widths) > len(self.path_points):
+                self.point_widths = self.point_widths[:len(self.path_points)]
+
         # Geometrias cacheadas para renderização em tempo real ultra-rápida (sem recálculos por quadro)
+        self.cum_lengths = [0.0]
         self.corridor_polygon = None
         self.corridor_poly_np = None
         self.resampled_arrows = None
@@ -377,31 +456,81 @@ class Route:
     def _rebuild_cache(self):
         """Reconstrói as geometrias pré-calculadas da rota."""
         if self.path_points and len(self.path_points) >= 2:
-            self.corridor_polygon = build_corridor_polygon(self.path_points, self.corridor_width)
+            self.cum_lengths = [0.0]
+            t_len = 0.0
+            for i in range(len(self.path_points) - 1):
+                p1, p2 = self.path_points[i], self.path_points[i + 1]
+                seg_l = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                t_len += seg_l
+                self.cum_lengths.append(t_len)
+            self.path_total_len = max(1.0, t_len)
+
+            if len(self.point_widths) != len(self.path_points):
+                if len(self.point_widths) < len(self.path_points):
+                    self.point_widths += [self.corridor_width] * (len(self.path_points) - len(self.point_widths))
+                else:
+                    self.point_widths = self.point_widths[:len(self.path_points)]
+
+            self.corridor_polygon = build_corridor_polygon(
+                self.path_points,
+                width_scale=self.corridor_width,
+                point_widths=self.point_widths,
+            )
             if self.corridor_polygon and len(self.corridor_polygon) >= 3:
                 self.corridor_poly_np = np.array(self.corridor_polygon, dtype=np.int32)
             else:
                 self.corridor_poly_np = None
 
-            # Calcula comprimento total
-            t_len = 0.0
-            for i in range(len(self.path_points) - 1):
-                p1, p2 = self.path_points[i], self.path_points[i + 1]
-                t_len += math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-            self.path_total_len = max(1.0, t_len)
-
             # Reamostra setas proporcionais ao comprimento do percurso
             arrow_spacing = max(35.0, min(75.0, self.path_total_len / 5.0))
             self.resampled_arrows = resample_polyline(self.path_points, step_px=arrow_spacing)
         else:
+            self.cum_lengths = [0.0]
             self.corridor_polygon = None
             self.corridor_poly_np = None
             self.resampled_arrows = None
             self.path_total_len = 1.0
 
+    def get_width_at_s(self, s_norm):
+        """Retorna a escala de largura calibrada na fração de progresso s (0.0=Início, 1.0=Fim)."""
+        if not self.point_widths:
+            return self.corridor_width
+        if len(self.point_widths) == 1:
+            return float(self.point_widths[0])
+
+        target_d = max(0.0, min(self.path_total_len, float(s_norm) * self.path_total_len))
+        if hasattr(self, 'cum_lengths') and len(self.cum_lengths) == len(self.point_widths):
+            for i in range(len(self.point_widths) - 1):
+                d0 = self.cum_lengths[i]
+                d1 = self.cum_lengths[i + 1]
+                if d0 <= target_d <= d1 or i == len(self.point_widths) - 2:
+                    sl = max(1e-5, d1 - d0)
+                    frac = max(0.0, min(1.0, (target_d - d0) / sl))
+                    return float(self.point_widths[i] + frac * (self.point_widths[i + 1] - self.point_widths[i]))
+            return float(self.point_widths[-1])
+        else:
+            n = len(self.point_widths)
+            val = float(s_norm) * (n - 1)
+            idx = int(math.floor(val))
+            if idx >= n - 1:
+                return float(self.point_widths[-1])
+            frac = val - idx
+            return float(self.point_widths[idx] + frac * (self.point_widths[idx + 1] - self.point_widths[idx]))
+
+    def set_point_width(self, point_idx, new_width):
+        """Ajusta a largura de um ponto específico do percurso."""
+        if 0 <= point_idx < len(self.point_widths):
+            self.point_widths[point_idx] = max(0.20, min(3.50, float(new_width)))
+            self.corridor_width = float(np.mean(self.point_widths))
+            self._rebuild_cache()
+
     def set_corridor_width(self, new_width):
-        """Ajusta dinamicamente a largura/espessura da faixa do percurso."""
-        self.corridor_width = max(0.25, min(3.0, float(new_width)))
+        """Ajusta a escala geral da rota mantendo a proporção entre os pontos."""
+        new_w = max(0.20, min(3.50, float(new_width)))
+        ratio = new_w / max(0.01, self.corridor_width)
+        self.corridor_width = new_w
+        if self.point_widths:
+            self.point_widths = [max(0.20, min(3.50, round(w * ratio, 2))) for w in self.point_widths]
         self._rebuild_cache()
 
     def to_dict(self):
@@ -413,6 +542,8 @@ class Route:
         if self.path_points:
             d["path_points"] = [list(p) for p in self.path_points]
             d["corridor_width"] = round(self.corridor_width, 2)
+            if self.point_widths:
+                d["point_widths"] = [round(w, 2) for w in self.point_widths]
         if self.polygon_a:
             d["polygon_a"] = [list(p) for p in self.polygon_a]
         if self.polygon_b:
@@ -438,6 +569,7 @@ class Route:
             name=data["name"],
             path_points=path_pts,
             corridor_width=data.get("corridor_width", 1.0),
+            point_widths=data.get("point_widths"),
             polygon_a=poly_a,
             polygon_b=poly_b,
             gate_a=tuple(tuple(p) for p in data["gate_a"]) if data.get("gate_a") else None,
@@ -560,14 +692,16 @@ class RouteEngine:
             s_curr, d_perp, closest_pt, tan_vec = s_c, d_c, cp_c, tan_c
             ref_pt = center_pt
 
-        hw = perspective_half_width(closest_pt[1], route.corridor_width)
+        w_curr = route.get_width_at_s(s_curr)
+        hw = perspective_half_width(closest_pt[1], w_curr)
         in_corridor = d_perp <= (hw * 1.25)
 
         # Segmento varrido entre frames
         if not in_corridor and prev_pt and prev_pt != ground_pt:
             mid_pt = ((prev_pt[0] + ground_pt[0]) * 0.5, (prev_pt[1] + ground_pt[1]) * 0.5)
             s_m, d_m, cp_m, tan_m, _ = project_point_to_path(mid_pt, route.path_points)
-            hw_m = perspective_half_width(cp_m[1], route.corridor_width)
+            w_m = route.get_width_at_s(s_m)
+            hw_m = perspective_half_width(cp_m[1], w_m)
             if d_m <= hw_m * 1.20:
                 in_corridor = True
                 s_curr, d_perp, closest_pt, tan_vec = s_m, d_m, cp_m, tan_m
@@ -589,7 +723,8 @@ class RouteEngine:
             if trail:
                 for tp in trail[:10]:
                     s_t, d_t, cp_t, _, _ = project_point_to_path(tp, route.path_points)
-                    hw_t = perspective_half_width(cp_t[1], route.corridor_width)
+                    w_t = route.get_width_at_s(s_t)
+                    hw_t = perspective_half_width(cp_t[1], w_t)
                     if d_t <= hw_t * 1.30 and s_t < s_earliest:
                         s_earliest = s_t
                         earliest_pos = tp

@@ -1,7 +1,7 @@
 import os
 import cv2
 from core.detector_tracker import VehicleDetectorTracker
-from core.route_engine import Route, RouteEngine, vehicle_in_polygon
+from core.route_engine import Route, RouteEngine, vehicle_in_polygon, build_corridor_polygon
 from core.config_manager import ConfigManager
 
 
@@ -254,6 +254,38 @@ def test_timeline_rollback():
     print(" -> Rollback Temporal e Dedução de Veículos APROVADOS COM SUCESSO!")
 
 
+def test_per_point_widths():
+    print("[TEST] Testando calibração de larguras individuais por ponto (point_widths)...")
+    pts = [(100, 200), (200, 300), (400, 500)]
+    widths = [0.50, 1.00, 1.80]
+    r = Route(1, "Rota com Larguras Individuais", path_points=pts, point_widths=widths)
+    assert len(r.point_widths) == 3
+    assert r.point_widths[0] == 0.50
+    assert r.point_widths[1] == 1.00
+    assert r.point_widths[2] == 1.80
+
+    # Verifica interpolação ao longo do percurso
+    assert abs(r.get_width_at_s(0.0) - 0.50) < 1e-3
+    assert abs(r.get_width_at_s(1.0) - 1.80) < 1e-3
+
+    # Testa modificação de ponto individual
+    r.set_point_width(0, 0.75)
+    assert r.point_widths[0] == 0.75
+    assert abs(r.get_width_at_s(0.0) - 0.75) < 1e-3
+
+    # Testa serialização / desserialização
+    d = r.to_dict()
+    assert "point_widths" in d
+    assert d["point_widths"] == [0.75, 1.0, 1.8]
+    r_loaded = Route.from_dict(d)
+    assert r_loaded.point_widths == [0.75, 1.0, 1.8]
+
+    # Verifica construção do polígono de corredor com larguras variáveis
+    poly = build_corridor_polygon(pts, point_widths=r.point_widths)
+    assert len(poly) >= 6, "Polígono de corredor variável deve conter vértices"
+    print(" -> Larguras individuais por ponto (point_widths) APROVADAS COM SUCESSO!")
+
+
 def test_video_dav_processing():
     print("[TEST] Testando processamento real em 'video.dav' com a calibração de rotas...")
     assert os.path.exists("video.dav"), "Arquivo video.dav não encontrado!"
@@ -302,5 +334,6 @@ if __name__ == "__main__":
     test_polygon_route_logic()
     test_single_directional_path()
     test_timeline_rollback()
+    test_per_point_widths()
     test_video_dav_processing()
     print("\nTODOS OS TESTES FORAM APROVADOS COM SUCESSO!")

@@ -83,6 +83,10 @@ class AppWindow:
         self.temp_route_name = ""
         self.temp_corridor_width = 1.0
         self.current_draw_points = []
+        self.current_draw_widths = []
+        self.active_draw_width = 1.0
+        self.hovered_draw_pt_idx = None
+        self.hovered_vertex_info = None
         self.mouse_video_pos = None
 
         # Armazenamento do frame atual em BGR para redesenho
@@ -686,8 +690,9 @@ class AppWindow:
 
         for route in self.route_engine.routes:
             if route.path_points and len(route.path_points) >= 2:
-                _, d_perp, closest_pt, _, _ = project_point_to_path((vx, vy), route.path_points)
-                hw = perspective_half_width(closest_pt[1], route.corridor_width)
+                s_val, d_perp, closest_pt, _, _ = project_point_to_path((vx, vy), route.path_points)
+                w_scale = route.get_width_at_s(s_val) if hasattr(route, 'get_width_at_s') else route.corridor_width
+                hw = perspective_half_width(closest_pt[1], w_scale)
                 eff_dist = max(0.0, d_perp - hw)
                 if eff_dist < best_dist:
                     best_dist = eff_dist
@@ -702,6 +707,24 @@ class AppWindow:
                 if r.route_id == self.selected_route_id:
                     return r
         return self.route_engine.routes[0] if self.route_engine.routes else None
+
+    def _find_vertex_at_pos(self, vx, vy, max_dist=24):
+        """Identifica se o cursor do mouse está sobre algum vértice de rota."""
+        # Se houver rota selecionada, prioriza seus pontos
+        if self.selected_route_id is not None:
+            for r in self.route_engine.routes:
+                if r.route_id == self.selected_route_id and r.path_points:
+                    for idx, p in enumerate(r.path_points):
+                        if math.hypot(vx - p[0], vy - p[1]) <= max_dist:
+                            return r, idx
+
+        # Senão, busca em todas as rotas
+        for r in self.route_engine.routes:
+            if r.path_points:
+                for idx, p in enumerate(r.path_points):
+                    if math.hypot(vx - p[0], vy - p[1]) <= max_dist:
+                        return r, idx
+        return None, None
 
     def _on_canvas_mouse_wheel(self, event):
         """Ajusta a espessura da faixa diretamente com a rodinha (scroll) do mouse sobre o vídeo."""
@@ -719,9 +742,37 @@ class AppWindow:
     def _step_route_width_at_pos(self, vx, vy, delta):
         """Modifica a largura da rota sob o cursor do mouse ou em modo de desenho."""
         if self.drawing_mode:
-            self.temp_corridor_width = max(0.20, min(2.80, round(self.temp_corridor_width + delta, 2)))
-            self.hud_message = f"📏 Nova Rota: Largura {self.temp_corridor_width:.2f}x (Scroll ↕ ou +/-)"
+            # Em modo de desenho:
+            if self.hovered_draw_pt_idx is not None and self.hovered_draw_pt_idx < len(self.current_draw_widths):
+                idx = self.hovered_draw_pt_idx
+                new_w = max(0.20, min(3.00, round(self.current_draw_widths[idx] + delta, 2)))
+                self.current_draw_widths[idx] = new_w
+                self.hud_message = f"📏 Ponto #{idx + 1}: Largura ajustada para {new_w:.2f}x (Scroll ↕)"
+                self.hud_time = time.time()
+            else:
+                self.active_draw_width = max(0.20, min(3.00, round(self.active_draw_width + delta, 2)))
+                pt_num = len(self.current_draw_points) + 1
+                self.hud_message = f"📏 Ponto #{pt_num} (no cursor): Largura {self.active_draw_width:.2f}x (Scroll ↕)"
+                self.hud_time = time.time()
+
+            if self.last_frame_bgr is not None:
+                self._render_frame(self.last_frame_bgr, [])
+            return
+
+        # Modo normal:
+        target_route, vertex_idx = self._find_vertex_at_pos(vx, vy)
+        if target_route is not None and vertex_idx is not None:
+            curr_w = target_route.point_widths[vertex_idx] if (target_route.point_widths and vertex_idx < len(target_route.point_widths)) else target_route.corridor_width
+            new_w = max(0.20, min(3.00, round(curr_w + delta, 2)))
+            target_route.set_point_width(vertex_idx, new_w)
+            self.selected_route_id = target_route.route_id
+            ConfigManager.save_routes(self.route_engine.routes)
+            self.hud_message = f"📏 [{target_route.name}] Ponto #{vertex_idx + 1}: Largura {new_w:.2f}x (Scroll ↕)"
             self.hud_time = time.time()
+            if target_route.route_id in self.scale_vars:
+                self.scale_vars[target_route.route_id].set(target_route.corridor_width)
+            if target_route.route_id in self.scale_labels:
+                self.scale_labels[target_route.route_id].config(text=f"{target_route.corridor_width:.2f}x")
             if self.last_frame_bgr is not None:
                 self._render_frame(self.last_frame_bgr, [])
             return
@@ -731,17 +782,44 @@ class AppWindow:
             self._adjust_route_width(target_route, delta)
 
     def _on_shortcut_adjust_width(self, delta):
-        """Atalho de teclado (+ ou -) para aumentar ou diminuir a largura da rota ativa."""
+        """Atalho de teclado (+ ou -) para aumentar ou diminuir a largura."""
         if self.drawing_mode:
-            self.temp_corridor_width = max(0.20, min(2.80, round(self.temp_corridor_width + delta, 2)))
-            self.hud_message = f"📏 Nova Rota: Largura {self.temp_corridor_width:.2f}x (Scroll ↕ ou +/-)"
-            self.hud_time = time.time()
+            if self.hovered_draw_pt_idx is not None and self.hovered_draw_pt_idx < len(self.current_draw_widths):
+                idx = self.hovered_draw_pt_idx
+                new_w = max(0.20, min(3.00, round(self.current_draw_widths[idx] + delta, 2)))
+                self.current_draw_widths[idx] = new_w
+                self.hud_message = f"📏 Ponto #{idx + 1}: Largura ajustada para {new_w:.2f}x (+/-)"
+                self.hud_time = time.time()
+            else:
+                self.active_draw_width = max(0.20, min(3.00, round(self.active_draw_width + delta, 2)))
+                pt_num = len(self.current_draw_points) + 1
+                self.hud_message = f"📏 Ponto #{pt_num} (no cursor): Largura {self.active_draw_width:.2f}x (+/-)"
+                self.hud_time = time.time()
+
             if self.last_frame_bgr is not None:
                 self._render_frame(self.last_frame_bgr, [])
             return
 
         target_route = None
         if self.mouse_video_pos:
+            vx, vy = self.mouse_video_pos
+            target_route, vertex_idx = self._find_vertex_at_pos(vx, vy)
+            if target_route is not None and vertex_idx is not None:
+                curr_w = target_route.point_widths[vertex_idx] if (target_route.point_widths and vertex_idx < len(target_route.point_widths)) else target_route.corridor_width
+                new_w = max(0.20, min(3.00, round(curr_w + delta, 2)))
+                target_route.set_point_width(vertex_idx, new_w)
+                self.selected_route_id = target_route.route_id
+                ConfigManager.save_routes(self.route_engine.routes)
+                self.hud_message = f"📏 [{target_route.name}] Ponto #{vertex_idx + 1}: Largura {new_w:.2f}x (+/-)"
+                self.hud_time = time.time()
+                if target_route.route_id in self.scale_vars:
+                    self.scale_vars[target_route.route_id].set(target_route.corridor_width)
+                if target_route.route_id in self.scale_labels:
+                    self.scale_labels[target_route.route_id].config(text=f"{target_route.corridor_width:.2f}x")
+                if self.last_frame_bgr is not None:
+                    self._render_frame(self.last_frame_bgr, [])
+                return
+
             target_route = self._find_target_route_at_pos(self.mouse_video_pos[0], self.mouse_video_pos[1])
 
         if target_route is None and self.selected_route_id is not None:
@@ -777,20 +855,34 @@ class AppWindow:
         if self.last_frame_bgr is not None:
             self._render_frame(self.last_frame_bgr, [])
 
-    def _draw_directional_corridor(self, display_frame, path_pts, color, name="", width_scale=1.0, is_preview=False, precomputed_poly_np=None, precomputed_arrows=None, is_active=False):
+    def _draw_directional_corridor(
+        self,
+        display_frame,
+        path_pts,
+        color,
+        name="",
+        width_scale=1.0,
+        point_widths=None,
+        is_preview=False,
+        precomputed_poly_np=None,
+        precomputed_arrows=None,
+        is_active=False,
+        hovered_pt_idx=None,
+    ):
         """
         Renderiza um Percurso Único Direcional (Início ➔ Fim) com:
-        - Faixa de corredor com blend de ROI translúcido nítido
-        - Destaque reforçado e contorno visual quando a rota estiver selecionada/ativa
+        - Faixa de corredor translúcida nítida com suporte a larguras variáveis por ponto
+        - Alças e barras transversais de espessura em cada vértice
+        - Destaque reforçado e contorno visual quando a rota estiver ativa
         - Setas direcionais ao longo do eixo central indicando o sentido válido (Início ➔ Fim)
-        - Marcadores de [INÍCIO] e [FIM] com o valor da largura atual
+        - Marcadores de [INÍCIO] e [FIM] com larguras
         """
         if not path_pts or len(path_pts) < 2:
             return
 
         poly_np = precomputed_poly_np
         if poly_np is None:
-            corridor_poly = build_corridor_polygon(path_pts, width_scale)
+            corridor_poly = build_corridor_polygon(path_pts, width_scale=width_scale, point_widths=point_widths)
             if corridor_poly and len(corridor_poly) >= 3:
                 poly_np = np.array(corridor_poly, dtype=np.int32)
 
@@ -838,15 +930,70 @@ class AppWindow:
                     tipLength=0.30,
                 )
 
+        n_pts = len(path_pts)
+        pw_list = point_widths if point_widths else [width_scale] * n_pts
+        if len(pw_list) < n_pts:
+            pw_list = list(pw_list) + [width_scale] * (n_pts - len(pw_list))
+
+        # Alças e barras transversais de espessura nos vértices
+        if is_active or is_preview:
+            for i in range(n_pts):
+                pt = path_pts[i]
+                w_i = pw_list[i]
+                is_hovered = (hovered_pt_idx == i)
+
+                if i == 0:
+                    dx = path_pts[1][0] - path_pts[0][0]
+                    dy = path_pts[1][1] - path_pts[0][1]
+                elif i == n_pts - 1:
+                    dx = path_pts[-1][0] - path_pts[-2][0]
+                    dy = path_pts[-1][1] - path_pts[-2][1]
+                else:
+                    dx = path_pts[i + 1][0] - path_pts[i - 1][0]
+                    dy = path_pts[i + 1][1] - path_pts[i - 1][1]
+
+                norm = math.hypot(dx, dy)
+                if norm < 1e-5:
+                    nx, ny = 0.0, 1.0
+                else:
+                    nx, ny = -dy / norm, dx / norm
+
+                hw = perspective_half_width(pt[1], w_i)
+                lx = int(round(pt[0] + nx * hw))
+                ly = int(round(pt[1] + ny * hw))
+                rx = int(round(pt[0] - nx * hw))
+                ry = int(round(pt[1] - ny * hw))
+
+                bar_col = (0, 240, 255) if is_hovered else (200, 200, 200)
+                bar_th = 2 if is_hovered else 1
+                cv2.line(display_frame, (lx, ly), (rx, ry), bar_col, bar_th, cv2.LINE_AA)
+                cv2.circle(display_frame, (lx, ly), 3, bar_col, -1, cv2.LINE_AA)
+                cv2.circle(display_frame, (rx, ry), 3, bar_col, -1, cv2.LINE_AA)
+
+                # Marcador central
+                p_col = (0, 255, 0) if i == 0 else ((0, 215, 255) if (i == n_pts - 1 and not is_preview) else (255, 170, 0))
+                radius = 8 if is_hovered else 5
+                cv2.circle(display_frame, pt, radius, p_col, -1, cv2.LINE_AA)
+                cv2.circle(display_frame, pt, radius + 2, (255, 255, 255), 1, cv2.LINE_AA)
+
+                if is_hovered:
+                    cv2.circle(display_frame, pt, radius + 6, (0, 220, 255), 2, cv2.LINE_AA)
+                    lbl = f"P{i + 1}: {w_i:.2f}x [Role Scroll ↕]"
+                    cv2.putText(display_frame, lbl, (pt[0] + 12, pt[1] - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 240, 255), 2, cv2.LINE_AA)
+                elif n_pts <= 10:
+                    lbl = f"P{i + 1}: {w_i:.2f}x"
+                    cv2.putText(display_frame, lbl, (pt[0] + 8, pt[1] - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (230, 230, 230), 1, cv2.LINE_AA)
+
         # Marcador de INÍCIO (Origem) com espessura
         p_start = path_pts[0]
-        cv2.circle(display_frame, p_start, 7, (0, 220, 0), -1, cv2.LINE_AA)
-        cv2.circle(display_frame, p_start, 9, (255, 255, 255), 1, cv2.LINE_AA)
-        start_lbl = f"[INÍCIO] {name} ({width_scale:.2f}x)" if name else f"[INÍCIO] ({width_scale:.2f}x)"
+        w_start = pw_list[0]
+        start_lbl = f"[INÍCIO] {name} ({w_start:.2f}x)" if name else f"[INÍCIO] ({w_start:.2f}x)"
         cv2.putText(
             display_frame,
             start_lbl,
-            (max(6, p_start[0] - 35), max(18, p_start[1] - 8)),
+            (max(6, p_start[0] - 35), max(18, p_start[1] - 14)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.48,
             (0, 255, 120),
@@ -855,20 +1002,20 @@ class AppWindow:
         )
 
         # Marcador de FIM (Destino)
-        p_end = path_pts[-1]
-        cv2.circle(display_frame, p_end, 7, (0, 215, 255), -1, cv2.LINE_AA)
-        cv2.circle(display_frame, p_end, 9, (0, 0, 255), 1, cv2.LINE_AA)
-        end_lbl = f"[FIM] {name}" if name else "[FIM]"
-        cv2.putText(
-            display_frame,
-            end_lbl,
-            (max(6, p_end[0] - 40), min(self.video_height - 8, p_end[1] + 18)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            (0, 235, 255),
-            1,
-            cv2.LINE_AA,
-        )
+        if not is_preview:
+            p_end = path_pts[-1]
+            w_end = pw_list[-1]
+            end_lbl = f"[FIM] {name} ({w_end:.2f}x)" if name else f"[FIM] ({w_end:.2f}x)"
+            cv2.putText(
+                display_frame,
+                end_lbl,
+                (max(6, p_end[0] - 40), min(self.video_height - 8, p_end[1] + 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (0, 235, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
     def _render_frame(self, frame_bgr, tracked_vehicles):
         """Renderiza o frame com cache de polígonos, HUD flutuante e redimensionamento otimizado."""
@@ -882,6 +1029,10 @@ class AppWindow:
         # 1. Desenha rotas configuradas
         for route in self.route_engine.routes:
             is_active = (route.route_id == self.selected_route_id)
+            hovered_idx = None
+            if self.hovered_vertex_info and self.hovered_vertex_info[0] == route.route_id:
+                hovered_idx = self.hovered_vertex_info[1]
+
             if route.path_points and len(route.path_points) >= 2:
                 self._draw_directional_corridor(
                     display_frame,
@@ -889,10 +1040,12 @@ class AppWindow:
                     route.color,
                     name=route.name,
                     width_scale=route.corridor_width,
+                    point_widths=route.point_widths,
                     is_preview=False,
                     precomputed_poly_np=route.corridor_poly_np,
                     precomputed_arrows=route.resampled_arrows,
                     is_active=is_active,
+                    hovered_pt_idx=hovered_idx,
                 )
             else:
                 if route.polygon_a and len(route.polygon_a) >= 3:
@@ -909,34 +1062,56 @@ class AppWindow:
                     cv2.polylines(display_frame, [pts_b], True, (0, 255, 255), 1, cv2.LINE_AA)
 
         # 2. Desenha pré-visualização em tempo real durante o desenho
-        if self.drawing_mode and self.current_draw_points:
-            preview_pts = list(self.current_draw_points)
-            if self.mouse_video_pos and preview_pts[-1] != self.mouse_video_pos:
-                preview_pts.append(self.mouse_video_pos)
-
-            if len(preview_pts) >= 2:
-                self._draw_directional_corridor(
-                    display_frame,
-                    preview_pts,
-                    color=(0, 255, 255),
-                    name=self.temp_route_name,
-                    width_scale=self.temp_corridor_width,
-                    is_preview=True,
-                    is_active=True,
-                )
-            else:
-                p0 = preview_pts[0]
-                cv2.circle(display_frame, p0, 7, (0, 255, 0), -1, cv2.LINE_AA)
+        if self.drawing_mode:
+            if not self.current_draw_points and self.mouse_video_pos:
+                # Nenhum ponto clicado ainda: exibe crossbar no cursor para o usuário calibrar o 1º ponto
+                mx, my = self.mouse_video_pos
+                hw = perspective_half_width(my, self.active_draw_width)
+                cv2.line(display_frame, (int(mx - hw), int(my)), (int(mx + hw), int(my)), (0, 240, 255), 2, cv2.LINE_AA)
+                cv2.circle(display_frame, (int(mx), int(my)), 7, (0, 255, 0), -1, cv2.LINE_AA)
+                cv2.circle(display_frame, (int(mx), int(my)), 10, (255, 255, 255), 1, cv2.LINE_AA)
                 cv2.putText(
                     display_frame,
-                    "[INÍCIO]",
-                    (max(6, p0[0] - 25), max(18, p0[1] - 8)),
+                    f"[INÍCIO] P1: {self.active_draw_width:.2f}x (Role o Scroll ↕ para ajustar)",
+                    (max(8, int(mx) - 60), max(22, int(my) - 14)),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.48,
-                    (0, 255, 0),
+                    0.50,
+                    (0, 255, 200),
                     1,
                     cv2.LINE_AA,
                 )
+            elif self.current_draw_points:
+                preview_pts = list(self.current_draw_points)
+                preview_widths = list(self.current_draw_widths)
+                if self.mouse_video_pos and preview_pts[-1] != self.mouse_video_pos:
+                    preview_pts.append(self.mouse_video_pos)
+                    preview_widths.append(self.active_draw_width)
+
+                if len(preview_pts) >= 2:
+                    self._draw_directional_corridor(
+                        display_frame,
+                        preview_pts,
+                        color=(0, 255, 255),
+                        name=self.temp_route_name,
+                        width_scale=self.active_draw_width,
+                        point_widths=preview_widths,
+                        is_preview=True,
+                        is_active=True,
+                        hovered_pt_idx=self.hovered_draw_pt_idx,
+                    )
+                else:
+                    p0 = preview_pts[0]
+                    cv2.circle(display_frame, p0, 7, (0, 255, 0), -1, cv2.LINE_AA)
+                    cv2.putText(
+                        display_frame,
+                        f"[INÍCIO] ({preview_widths[0]:.2f}x)",
+                        (max(6, p0[0] - 25), max(18, p0[1] - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.48,
+                        (0, 255, 0),
+                        1,
+                        cv2.LINE_AA,
+                    )
 
         # 3. Desenha caixas, IDs e trilhas dos veículos rastreados
         for v in tracked_vehicles:
@@ -1367,12 +1542,15 @@ class AppWindow:
         self.temp_corridor_width = 1.0
         self.drawing_mode = True
         self.current_draw_points = []
+        self.current_draw_widths = []
+        self.active_draw_width = 1.0
+        self.hovered_draw_pt_idx = None
         self.mouse_video_pos = None
 
         self.draw_banner_frame.pack(fill=tk.X, before=self.canvas_frame, pady=(0, 6))
         self.draw_banner_lbl.config(
-            text=f"[{self.temp_route_name}] ➔ PASSO ÚNICO: Clique ou arraste no vídeo acompanhando a via, do [INÍCIO] ao [FIM].\n"
-                 f"💡 Dica: Gire o Scroll do mouse ou aperte +/- para calibrar a largura da faixa em tempo real! Enter para salvar."
+            text=f"[{self.temp_route_name}] ➔ PASSO ÚNICO: Clique nos pontos do [INÍCIO] ao [FIM].\n"
+                 f"💡 Dica: Role o Scroll do mouse para calibrar a largura de CADA PONTO individualmente! Enter para salvar."
         )
         self.btn_finish_step.config(text="✓ Concluir e Salvar Percurso (Enter)", bg="#2a9d8f", fg="#ffffff")
 
@@ -1387,17 +1565,24 @@ class AppWindow:
         if len(self.current_draw_points) < 2:
             messagebox.showwarning(
                 "Percurso Incompleto",
-                "Clique em pelo menos 2 pontos (ou arraste o mouse) do [INÍCIO] até o [FIM] da via.",
+                "Clique em pelo menos 2 pontos do [INÍCIO] até o [FIM] da via.",
                 parent=self.root
             )
             return
 
         cleaned_pts = [self.current_draw_points[0]]
-        for pt in self.current_draw_points[1:]:
+        cleaned_widths = [self.current_draw_widths[0] if self.current_draw_widths else 1.0]
+        for i in range(1, len(self.current_draw_points)):
+            pt = self.current_draw_points[i]
+            w = self.current_draw_widths[i] if i < len(self.current_draw_widths) else 1.0
             if math.hypot(pt[0] - cleaned_pts[-1][0], pt[1] - cleaned_pts[-1][1]) >= 16:
                 cleaned_pts.append(pt)
+                cleaned_widths.append(w)
+
         if cleaned_pts[-1] != self.current_draw_points[-1]:
             cleaned_pts.append(self.current_draw_points[-1])
+            w_last = self.current_draw_widths[-1] if self.current_draw_widths else 1.0
+            cleaned_widths.append(w_last)
 
         if len(cleaned_pts) < 2 or math.hypot(cleaned_pts[-1][0] - cleaned_pts[0][0], cleaned_pts[-1][1] - cleaned_pts[0][1]) < 12:
             messagebox.showwarning(
@@ -1414,14 +1599,15 @@ class AppWindow:
             route_id=r_id,
             name=self.temp_route_name,
             path_points=cleaned_pts,
-            corridor_width=self.temp_corridor_width,
+            corridor_width=float(np.mean(cleaned_widths)),
+            point_widths=cleaned_widths,
             color=color,
         )
         self.route_engine.add_route(new_route)
         self.selected_route_id = new_route.route_id
         ConfigManager.save_routes(self.route_engine.routes)
 
-        self.hud_message = f"✓ {new_route.name} criada! Role o Scroll ↕ ou use +/- para afinar/alargar."
+        self.hud_message = f"✓ {new_route.name} criada! Gire o Scroll ↕ sobre qualquer ponto para afiná-lo/alargá-lo."
         self.hud_time = time.time()
 
         self._cancel_drawing()
@@ -1434,6 +1620,9 @@ class AppWindow:
         """Cancela o modo de desenho."""
         self.drawing_mode = False
         self.current_draw_points = []
+        self.current_draw_widths = []
+        self.active_draw_width = 1.0
+        self.hovered_draw_pt_idx = None
         self.mouse_video_pos = None
         self.draw_banner_frame.pack_forget()
 
@@ -1459,7 +1648,17 @@ class AppWindow:
                 self._select_route(target.route_id)
             return
 
-        self.current_draw_points.append(pt)
+        # Modo de desenho:
+        if self.hovered_draw_pt_idx is not None and self.hovered_draw_pt_idx < len(self.current_draw_widths):
+            self.hud_message = f"Ponto #{self.hovered_draw_pt_idx + 1} selecionado ({self.current_draw_widths[self.hovered_draw_pt_idx]:.2f}x). Gire Scroll ↕ para ajustar."
+            self.hud_time = time.time()
+        else:
+            self.current_draw_points.append(pt)
+            self.current_draw_widths.append(self.active_draw_width)
+            pt_num = len(self.current_draw_points)
+            self.hud_message = f"✓ Ponto #{pt_num} marcado ({self.active_draw_width:.2f}x)! Posicione o Ponto #{pt_num + 1} (Scroll ↕ para calibrar largura)"
+            self.hud_time = time.time()
+
         if self.last_frame_bgr is not None:
             self._render_frame(self.last_frame_bgr, [])
 
@@ -1470,10 +1669,12 @@ class AppWindow:
         pt = self._canvas_to_video_coords(event.x, event.y)
         if not self.current_draw_points:
             self.current_draw_points.append(pt)
+            self.current_draw_widths.append(self.active_draw_width)
         else:
             last = self.current_draw_points[-1]
-            if math.hypot(pt[0] - last[0], pt[1] - last[1]) > 20:
+            if math.hypot(pt[0] - last[0], pt[1] - last[1]) > 25:
                 self.current_draw_points.append(pt)
+                self.current_draw_widths.append(self.active_draw_width)
 
         self.mouse_video_pos = pt
         if self.last_frame_bgr is not None:
@@ -1483,8 +1684,23 @@ class AppWindow:
         pt = self._canvas_to_video_coords(event.x, event.y)
         self.mouse_video_pos = pt
 
-        if self.drawing_mode and self.current_draw_points and self.last_frame_bgr is not None:
-            self._render_frame(self.last_frame_bgr, [])
+        if self.drawing_mode:
+            hovered_idx = None
+            for idx, p in enumerate(self.current_draw_points):
+                if math.hypot(pt[0] - p[0], pt[1] - p[1]) <= 22:
+                    hovered_idx = idx
+                    break
+            old_h = self.hovered_draw_pt_idx
+            self.hovered_draw_pt_idx = hovered_idx
+            if (old_h != hovered_idx or len(self.current_draw_points) >= 1) and self.last_frame_bgr is not None:
+                self._render_frame(self.last_frame_bgr, [])
+        else:
+            target_r, v_idx = self._find_vertex_at_pos(pt[0], pt[1])
+            new_hover = (target_r.route_id, v_idx) if (target_r and v_idx is not None) else None
+            old_hover = self.hovered_vertex_info
+            self.hovered_vertex_info = new_hover
+            if old_hover != new_hover and self.last_frame_bgr is not None:
+                self._render_frame(self.last_frame_bgr, [])
 
     def _delete_route(self, route_id):
         if messagebox.askyesno("Excluir Percurso", "Tem certeza que deseja remover este percurso?"):
@@ -1516,6 +1732,7 @@ class AppWindow:
                 name="Rota 1: Fundo -> CAM1 (Direita)",
                 path_points=[(425, 295), (585, 420), (770, 555), (1060, 675)],
                 corridor_width=1.0,
+                point_widths=[0.85, 0.95, 1.05, 1.15],
                 color=(0, 255, 255),
             )
 
@@ -1525,6 +1742,7 @@ class AppWindow:
                 name="Rota 2: Via Distante (Direita -> Fundo)",
                 path_points=[(1265, 395), (1120, 355), (955, 325)],
                 corridor_width=0.85,
+                point_widths=[0.90, 0.85, 0.80],
                 color=(255, 160, 0),
             )
 
@@ -1533,7 +1751,7 @@ class AppWindow:
             self.selected_route_id = 1
             ConfigManager.save_routes(self.route_engine.routes)
 
-            self.hud_message = "✓ Percursos padrão carregados! Role o Scroll do mouse para ajustar a largura."
+            self.hud_message = "✓ Percursos padrão carregados! Role o Scroll do mouse sobre qualquer ponto para calibrar."
             self.hud_time = time.time()
 
             self._refresh_route_cards()
