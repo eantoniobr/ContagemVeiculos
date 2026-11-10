@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from core.detector_tracker import VehicleDetectorTracker, CATEGORY_COLORS
-from core.route_engine import Route, RouteEngine, build_corridor_polygon, resample_polyline
+from core.route_engine import Route, RouteEngine, build_corridor_polygon, resample_polyline, project_point_to_path, perspective_half_width
 from core.config_manager import ConfigManager
 
 ROUTE_PALETTE = [
@@ -46,6 +46,17 @@ class AppWindow:
         for r in loaded_routes:
             self.route_engine.add_route(r)
 
+        # Rota ativa/selecionada para controle de espessura (scroll ou +/-)
+        self.selected_route_id = loaded_routes[0].route_id if loaded_routes else None
+
+        # Feedback visual flutuante (HUD) na tela do vídeo
+        self.hud_message = ""
+        self.hud_time = 0.0
+
+        # Dicionários de widgets para atualização rápida sem recriação do painel
+        self.scale_vars = {}
+        self.scale_labels = {}
+
         # Estado da reprodução
         self.cap = cv2.VideoCapture(self.video_path)
         if not self.cap.isOpened():
@@ -70,6 +81,7 @@ class AppWindow:
         # Estado do modo de desenho de Percurso Único Direcional (Início ➔ Fim)
         self.drawing_mode = False
         self.temp_route_name = ""
+        self.temp_corridor_width = 1.0
         self.current_draw_points = []
         self.mouse_video_pos = None
 
@@ -155,6 +167,33 @@ class AppWindow:
         self.canvas.bind("<Motion>", self._on_canvas_motion)
         self.canvas.bind("<Double-Button-1>", lambda e: self._finish_current_draw_step())
         self.canvas.bind("<Button-3>", lambda e: self._finish_current_draw_step())
+
+        # Scroll do mouse no Canvas para ajustar a espessura da via (Windows e Linux)
+        self.canvas.bind("<MouseWheel>", self._on_canvas_mouse_wheel)
+        self.canvas.bind("<Button-4>", lambda e: self._on_canvas_wheel_dir(+1, e))
+        self.canvas.bind("<Button-5>", lambda e: self._on_canvas_wheel_dir(-1, e))
+
+        # Teclas de atalho para aumentar (+) ou diminuir (-) a espessura da faixa
+        for key in ["<plus>", "<KP_Add>", "<equal>", "<bracketright>"]:
+            self.root.bind(key, lambda e: self._on_shortcut_adjust_width(+0.10))
+        for key in ["<minus>", "<KP_Subtract>", "<underscore>", "<bracketleft>"]:
+            self.root.bind(key, lambda e: self._on_shortcut_adjust_width(-0.10))
+
+        # Listener global para caracteres '+' e '-' em qualquer teclado
+        def _on_global_key(e):
+            if self.drawing_mode and e.keysym in ("Return", "Escape"):
+                return
+            if e.char in ("+", "="):
+                self._on_shortcut_adjust_width(+0.10)
+            elif e.char in ("-", "_"):
+                self._on_shortcut_adjust_width(-0.10)
+            elif e.char in ("]", "}"):
+                self._on_shortcut_adjust_width(+0.10)
+            elif e.char in ("[", "{"):
+                self._on_shortcut_adjust_width(-0.10)
+
+        self.root.bind("<Key>", _on_global_key, add="+")
+
         self.root.bind("<Return>", lambda e: self._finish_current_draw_step() if self.drawing_mode else None)
         self.root.bind("<Escape>", lambda e: self._cancel_drawing() if self.drawing_mode else None)
         self.root.bind("<Left>", lambda e: self._jump_relative(-5) if not self.drawing_mode else None)
@@ -241,7 +280,7 @@ class AppWindow:
 
         self.lbl_rollback_notice = tk.Label(
             nav_row,
-            text="Linha do Tempo: Arraste o cursor ou use [ ◀ -5s ] / [ +5s ▶ ] para retroceder e descontar contagens.",
+            text="Dica: Role a rodinha do mouse (scroll) ou aperte +/- para afinar ou alargar a via no vídeo.",
             bg="#1a1a24",
             fg="#72efdd",
             font=("Segoe UI", 8),
@@ -428,9 +467,12 @@ class AppWindow:
         self._refresh_route_cards()
 
     def _refresh_route_cards(self):
-        """Reconstrói os cards visuais de contagem com controle de espessura da faixa para cada percurso."""
+        """Reconstrói os cards com controles interativos de espessura (slider + botões + scroll)."""
         for widget in self.cards_container.winfo_children():
             widget.destroy()
+
+        self.scale_vars.clear()
+        self.scale_labels.clear()
 
         if not self.route_engine.routes:
             lbl_empty = tk.Label(
@@ -446,20 +488,35 @@ class AppWindow:
             return
 
         for route in self.route_engine.routes:
-            card = tk.Frame(self.cards_container, bg="#1d1d24", bd=1, relief=tk.SOLID, padx=8, pady=8)
+            is_selected = (route.route_id == self.selected_route_id)
+            card_bd = 2 if is_selected else 1
+            card_highlight = "#00b4d8" if is_selected else "#3a3a46"
+
+            card = tk.Frame(self.cards_container, bg="#1d1d24", bd=card_bd, relief=tk.SOLID, padx=8, pady=6, highlightbackground=card_highlight, highlightthickness=card_bd)
             card.pack(fill=tk.X, pady=4)
+
+            # Clicar no card seleciona a rota ativa
+            card.bind("<Button-1>", lambda e, r=route: self._select_route(r.route_id))
 
             header = tk.Frame(card, bg="#1d1d24")
             header.pack(fill=tk.X)
+            header.bind("<Button-1>", lambda e, r=route: self._select_route(r.route_id))
+
+            # Indicador de cor da rota
+            hex_color = f"#{route.color[2]:02x}{route.color[1]:02x}{route.color[0]:02x}"
+            dot = tk.Label(header, text="●", fg=hex_color, bg="#1d1d24", font=("Segoe UI", 12, "bold"))
+            dot.pack(side=tk.LEFT, padx=(0, 4))
+            dot.bind("<Button-1>", lambda e, r=route: self._select_route(r.route_id))
 
             lbl_name = tk.Label(
                 header,
-                text=route.name,
+                text=route.name + ("  [ATIVA]" if is_selected else ""),
                 bg="#1d1d24",
-                fg="#e0e1dd",
-                font=("Segoe UI", 10, "bold")
+                fg="#72efdd" if is_selected else "#e0e1dd",
+                font=("Segoe UI", 10, "bold" if is_selected else "normal")
             )
             lbl_name.pack(side=tk.LEFT)
+            lbl_name.bind("<Button-1>", lambda e, r=route: self._select_route(r.route_id))
 
             btn_del = tk.Button(
                 header,
@@ -473,56 +530,84 @@ class AppWindow:
             )
             btn_del.pack(side=tk.RIGHT)
 
-            # Controles de Largura/Espessura da Faixa (Mais Fina / Mais Larga)
+            # Controles de Largura/Espessura da Faixa com Slider e Scroll
             if route.path_points:
                 width_row = tk.Frame(card, bg="#1d1d24")
-                width_row.pack(fill=tk.X, pady=(2, 2))
+                width_row.pack(fill=tk.X, pady=(4, 2))
 
                 tk.Label(
                     width_row,
                     text="Faixa:",
                     bg="#1d1d24",
                     fg="#a0a0b0",
-                    font=("Segoe UI", 8)
-                ).pack(side=tk.LEFT)
+                    font=("Segoe UI", 8, "bold")
+                ).pack(side=tk.LEFT, padx=(0, 2))
 
                 btn_w_minus = tk.Button(
                     width_row,
-                    text="➖ Mais Fina",
-                    command=lambda r=route: self._adjust_route_width(r, -0.20),
+                    text="➖",
+                    command=lambda r=route: self._adjust_route_width(r, -0.10),
                     bg="#2a2a35",
                     fg="#ffffff",
-                    font=("Segoe UI", 7, "bold"),
+                    font=("Segoe UI", 8, "bold"),
                     relief=tk.FLAT,
                     padx=5,
-                    pady=1,
+                    pady=0,
                     cursor="hand2"
                 )
-                btn_w_minus.pack(side=tk.LEFT, padx=3)
+                btn_w_minus.pack(side=tk.LEFT)
 
-                lbl_w_val = tk.Label(
+                # Slider Interativo de Arrasto
+                w_var = tk.DoubleVar(value=route.corridor_width)
+                self.scale_vars[route.route_id] = w_var
+                scale_w = ttk.Scale(
                     width_row,
-                    text=f"{route.corridor_width:.1f}x",
-                    bg="#1d1d24",
-                    fg="#00b4d8",
-                    font=("Segoe UI", 8, "bold"),
-                    width=4
+                    from_=0.20,
+                    to=2.80,
+                    orient=tk.HORIZONTAL,
+                    variable=w_var,
+                    command=lambda val, r=route: self._on_scale_route_width(r, val)
                 )
-                lbl_w_val.pack(side=tk.LEFT, padx=1)
+                scale_w.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
 
                 btn_w_plus = tk.Button(
                     width_row,
-                    text="➕ Mais Larga",
-                    command=lambda r=route: self._adjust_route_width(r, +0.20),
+                    text="➕",
+                    command=lambda r=route: self._adjust_route_width(r, +0.10),
                     bg="#2a2a35",
                     fg="#ffffff",
-                    font=("Segoe UI", 7, "bold"),
+                    font=("Segoe UI", 8, "bold"),
                     relief=tk.FLAT,
                     padx=5,
-                    pady=1,
+                    pady=0,
                     cursor="hand2"
                 )
-                btn_w_plus.pack(side=tk.LEFT, padx=3)
+                btn_w_plus.pack(side=tk.LEFT)
+
+                lbl_w_val = tk.Label(
+                    width_row,
+                    text=f"{route.corridor_width:.2f}x",
+                    bg="#1d1d24",
+                    fg="#00b4d8",
+                    font=("Segoe UI", 8, "bold"),
+                    width=6
+                )
+                lbl_w_val.pack(side=tk.LEFT, padx=(2, 0))
+                self.scale_labels[route.route_id] = lbl_w_val
+
+                # Bind de scroll diretamente sobre o card do percurso
+                card.bind("<MouseWheel>", lambda e, r=route: self._on_card_mouse_wheel(r, e))
+                width_row.bind("<MouseWheel>", lambda e, r=route: self._on_card_mouse_wheel(r, e))
+                scale_w.bind("<MouseWheel>", lambda e, r=route: self._on_card_mouse_wheel(r, e))
+
+                tip_lbl = tk.Label(
+                    card,
+                    text="🖱️ Aponte na rota e gire o Scroll do mouse ou aperte +/-",
+                    bg="#1d1d24",
+                    fg="#778da9",
+                    font=("Segoe UI", 7, "italic")
+                )
+                tip_lbl.pack(anchor=tk.W, pady=(0, 2))
 
             c = route.counts
             subtotal = sum(c.values())
@@ -533,20 +618,143 @@ class AppWindow:
                 fg="#a8dadc",
                 font=("Segoe UI", 9),
                 justify=tk.LEFT,
-                pady=2
+                pady=1
             )
             lbl_counts.pack(anchor=tk.W)
 
         self._update_total_card()
 
-    def _adjust_route_width(self, route, delta):
-        """Ajusta a espessura da faixa da rota e atualiza a tela instantaneamente."""
-        new_w = max(0.3, min(2.5, round(route.corridor_width + delta, 2)))
+    def _select_route(self, route_id):
+        """Seleciona a rota ativa para ajuste visual e atualiza a interface."""
+        if self.selected_route_id != route_id:
+            self.selected_route_id = route_id
+            for r in self.route_engine.routes:
+                if r.route_id == route_id:
+                    self.hud_message = f"🎯 [{r.name}] selecionada. Role o Scroll ↕ ou use +/- para ajustar a largura."
+                    self.hud_time = time.time()
+                    break
+            self._refresh_route_cards()
+            if self.last_frame_bgr is not None:
+                self._render_frame(self.last_frame_bgr, [])
+
+    def _on_card_mouse_wheel(self, route, event):
+        """Ajusta a largura ao girar a rodinha do mouse sobre o card da rota."""
+        delta = 0.10 if event.delta > 0 else -0.10
+        self._adjust_route_width(route, delta)
+        return "break"
+
+    def _on_scale_route_width(self, route, val):
+        """Chamado continuamente enquanto o usuário arrasta a barra deslizante (slider) da faixa."""
+        new_w = max(0.20, min(2.80, round(float(val), 2)))
         route.set_corridor_width(new_w)
+        if route.route_id in self.scale_labels:
+            self.scale_labels[route.route_id].config(text=f"{new_w:.2f}x")
+        self.selected_route_id = route.route_id
+        self.hud_message = f"📏 [{route.name}] Largura: {new_w:.2f}x (Scroll ↕ ou +/-)"
+        self.hud_time = time.time()
         ConfigManager.save_routes(self.route_engine.routes)
-        self._refresh_route_cards()
         if self.last_frame_bgr is not None:
             self._render_frame(self.last_frame_bgr, [])
+
+    def _adjust_route_width(self, route, delta):
+        """Ajusta a espessura da faixa da rota e atualiza a tela instantaneamente."""
+        new_w = max(0.20, min(2.80, round(route.corridor_width + delta, 2)))
+        route.set_corridor_width(new_w)
+        ConfigManager.save_routes(self.route_engine.routes)
+        self.selected_route_id = route.route_id
+        self.hud_message = f"📏 [{route.name}] Largura: {new_w:.2f}x (Scroll ↕ ou +/-)"
+        self.hud_time = time.time()
+
+        if route.route_id in self.scale_vars:
+            self.scale_vars[route.route_id].set(new_w)
+        if route.route_id in self.scale_labels:
+            self.scale_labels[route.route_id].config(text=f"{new_w:.2f}x")
+
+        if self.last_frame_bgr is not None:
+            self._render_frame(self.last_frame_bgr, [])
+
+    def _find_target_route_at_pos(self, vx, vy):
+        """Identifica de forma inteligente a rota sob o cursor do mouse no vídeo."""
+        if not self.route_engine.routes:
+            return None
+
+        if len(self.route_engine.routes) == 1:
+            return self.route_engine.routes[0]
+
+        best_route = None
+        best_dist = float("inf")
+
+        for route in self.route_engine.routes:
+            if route.path_points and len(route.path_points) >= 2:
+                _, d_perp, closest_pt, _, _ = project_point_to_path((vx, vy), route.path_points)
+                hw = perspective_half_width(closest_pt[1], route.corridor_width)
+                eff_dist = max(0.0, d_perp - hw)
+                if eff_dist < best_dist:
+                    best_dist = eff_dist
+                    best_route = route
+
+        if best_route is not None and best_dist < 180.0:
+            return best_route
+
+        # Fallback: rota ativa selecionada ou primeira rota
+        if self.selected_route_id is not None:
+            for r in self.route_engine.routes:
+                if r.route_id == self.selected_route_id:
+                    return r
+        return self.route_engine.routes[0] if self.route_engine.routes else None
+
+    def _on_canvas_mouse_wheel(self, event):
+        """Ajusta a espessura da faixa diretamente com a rodinha (scroll) do mouse sobre o vídeo."""
+        direction = 1 if event.delta > 0 else -1
+        vx, vy = self._canvas_to_video_coords(event.x, event.y)
+        self._step_route_width_at_pos(vx, vy, direction * 0.10)
+        return "break"
+
+    def _on_canvas_wheel_dir(self, direction, event):
+        """Suporte para botões Button-4 e Button-5 (Linux/X11)."""
+        vx, vy = self._canvas_to_video_coords(event.x, event.y)
+        self._step_route_width_at_pos(vx, vy, direction * 0.10)
+        return "break"
+
+    def _step_route_width_at_pos(self, vx, vy, delta):
+        """Modifica a largura da rota sob o cursor do mouse ou em modo de desenho."""
+        if self.drawing_mode:
+            self.temp_corridor_width = max(0.20, min(2.80, round(self.temp_corridor_width + delta, 2)))
+            self.hud_message = f"📏 Nova Rota: Largura {self.temp_corridor_width:.2f}x (Scroll ↕ ou +/-)"
+            self.hud_time = time.time()
+            if self.last_frame_bgr is not None:
+                self._render_frame(self.last_frame_bgr, [])
+            return
+
+        target_route = self._find_target_route_at_pos(vx, vy)
+        if target_route is not None:
+            self._adjust_route_width(target_route, delta)
+
+    def _on_shortcut_adjust_width(self, delta):
+        """Atalho de teclado (+ ou -) para aumentar ou diminuir a largura da rota ativa."""
+        if self.drawing_mode:
+            self.temp_corridor_width = max(0.20, min(2.80, round(self.temp_corridor_width + delta, 2)))
+            self.hud_message = f"📏 Nova Rota: Largura {self.temp_corridor_width:.2f}x (Scroll ↕ ou +/-)"
+            self.hud_time = time.time()
+            if self.last_frame_bgr is not None:
+                self._render_frame(self.last_frame_bgr, [])
+            return
+
+        target_route = None
+        if self.mouse_video_pos:
+            target_route = self._find_target_route_at_pos(self.mouse_video_pos[0], self.mouse_video_pos[1])
+
+        if target_route is None and self.selected_route_id is not None:
+            for r in self.route_engine.routes:
+                if r.route_id == self.selected_route_id:
+                    target_route = r
+                    break
+
+        if target_route is None and self.route_engine.routes:
+            target_route = self.route_engine.routes[0]
+
+        if target_route is not None:
+            self._adjust_route_width(target_route, delta)
 
     def _update_total_card(self):
         t = self.route_engine.total_counts
@@ -569,12 +777,13 @@ class AppWindow:
         if self.last_frame_bgr is not None:
             self._render_frame(self.last_frame_bgr, [])
 
-    def _draw_directional_corridor(self, display_frame, path_pts, color, name="", width_scale=1.0, is_preview=False, precomputed_poly_np=None, precomputed_arrows=None):
+    def _draw_directional_corridor(self, display_frame, path_pts, color, name="", width_scale=1.0, is_preview=False, precomputed_poly_np=None, precomputed_arrows=None, is_active=False):
         """
         Renderiza um Percurso Único Direcional (Início ➔ Fim) com:
-        - Faixa de corredor fina ajustada à perspectiva com blend local de ROI
+        - Faixa de corredor com blend de ROI translúcido nítido
+        - Destaque reforçado e contorno visual quando a rota estiver selecionada/ativa
         - Setas direcionais ao longo do eixo central indicando o sentido válido (Início ➔ Fim)
-        - Marcadores discretos de [INÍCIO] e [FIM]
+        - Marcadores de [INÍCIO] e [FIM] com o valor da largura atual
         """
         if not path_pts or len(path_pts) < 2:
             return
@@ -598,9 +807,14 @@ class AppWindow:
                 poly_offset = poly_np - [rx1, ry1]
                 cv2.fillPoly(mask, [poly_offset], color)
 
-                alpha = 0.20 if not is_preview else 0.28
+                alpha = 0.32 if is_active else (0.24 if not is_preview else 0.30)
                 cv2.addWeighted(mask, alpha, roi, 1.0, 0, roi)
-                cv2.polylines(display_frame, [poly_np], True, color, 1, cv2.LINE_AA)
+
+                # Contorno externo bem visível
+                line_thick = 2 if is_active else 1
+                cv2.polylines(display_frame, [poly_np], True, color, line_thick, cv2.LINE_AA)
+                if is_active:
+                    cv2.polylines(display_frame, [poly_np], True, (255, 255, 255), 1, cv2.LINE_AA)
 
         # Desenha setas direcionais indicando o sentido (Início -> Fim)
         resampled = precomputed_arrows
@@ -610,6 +824,7 @@ class AppWindow:
             resampled = resample_polyline(path_pts, step_px=step)
 
         if resampled and len(resampled) >= 2:
+            arrow_color = (255, 255, 255) if is_active else color
             for i in range(len(resampled) - 1):
                 p1 = resampled[i]
                 p2 = resampled[i + 1]
@@ -617,23 +832,23 @@ class AppWindow:
                     display_frame,
                     p1,
                     p2,
-                    color,
+                    arrow_color,
                     2,
                     cv2.LINE_AA,
                     tipLength=0.30,
                 )
 
-        # Marcador de INÍCIO (Origem)
+        # Marcador de INÍCIO (Origem) com espessura
         p_start = path_pts[0]
-        cv2.circle(display_frame, p_start, 6, (0, 220, 0), -1, cv2.LINE_AA)
-        cv2.circle(display_frame, p_start, 8, (255, 255, 255), 1, cv2.LINE_AA)
-        start_lbl = f"[INÍCIO] {name}" if name else "[INÍCIO]"
+        cv2.circle(display_frame, p_start, 7, (0, 220, 0), -1, cv2.LINE_AA)
+        cv2.circle(display_frame, p_start, 9, (255, 255, 255), 1, cv2.LINE_AA)
+        start_lbl = f"[INÍCIO] {name} ({width_scale:.2f}x)" if name else f"[INÍCIO] ({width_scale:.2f}x)"
         cv2.putText(
             display_frame,
             start_lbl,
             (max(6, p_start[0] - 35), max(18, p_start[1] - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.46,
+            0.48,
             (0, 255, 120),
             1,
             cv2.LINE_AA,
@@ -641,8 +856,8 @@ class AppWindow:
 
         # Marcador de FIM (Destino)
         p_end = path_pts[-1]
-        cv2.circle(display_frame, p_end, 6, (0, 215, 255), -1, cv2.LINE_AA)
-        cv2.circle(display_frame, p_end, 8, (0, 0, 255), 1, cv2.LINE_AA)
+        cv2.circle(display_frame, p_end, 7, (0, 215, 255), -1, cv2.LINE_AA)
+        cv2.circle(display_frame, p_end, 9, (0, 0, 255), 1, cv2.LINE_AA)
         end_lbl = f"[FIM] {name}" if name else "[FIM]"
         cv2.putText(
             display_frame,
@@ -656,7 +871,7 @@ class AppWindow:
         )
 
     def _render_frame(self, frame_bgr, tracked_vehicles):
-        """Renderiza o frame com cache de polígonos e redimensionamento otimizado."""
+        """Renderiza o frame com cache de polígonos, HUD flutuante e redimensionamento otimizado."""
         canvas_w = self.canvas.winfo_width()
         canvas_h = self.canvas.winfo_height()
         if canvas_w < 50 or canvas_h < 50:
@@ -664,8 +879,9 @@ class AppWindow:
 
         display_frame = frame_bgr.copy()
 
-        # 1. Desenha rotas configuradas (usando polígonos e setas pré-calculados do cache)
+        # 1. Desenha rotas configuradas
         for route in self.route_engine.routes:
+            is_active = (route.route_id == self.selected_route_id)
             if route.path_points and len(route.path_points) >= 2:
                 self._draw_directional_corridor(
                     display_frame,
@@ -676,6 +892,7 @@ class AppWindow:
                     is_preview=False,
                     precomputed_poly_np=route.corridor_poly_np,
                     precomputed_arrows=route.resampled_arrows,
+                    is_active=is_active,
                 )
             else:
                 if route.polygon_a and len(route.polygon_a) >= 3:
@@ -703,18 +920,19 @@ class AppWindow:
                     preview_pts,
                     color=(0, 255, 255),
                     name=self.temp_route_name,
-                    width_scale=1.0,
+                    width_scale=self.temp_corridor_width,
                     is_preview=True,
+                    is_active=True,
                 )
             else:
                 p0 = preview_pts[0]
-                cv2.circle(display_frame, p0, 6, (0, 255, 0), -1, cv2.LINE_AA)
+                cv2.circle(display_frame, p0, 7, (0, 255, 0), -1, cv2.LINE_AA)
                 cv2.putText(
                     display_frame,
                     "[INÍCIO]",
                     (max(6, p0[0] - 25), max(18, p0[1] - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.46,
+                    0.48,
                     (0, 255, 0),
                     1,
                     cv2.LINE_AA,
@@ -754,6 +972,30 @@ class AppWindow:
             if len(trail) > 1:
                 for i in range(1, len(trail)):
                     cv2.line(display_frame, trail[i - 1], trail[i], color, 2)
+
+        # 4. Desenha badge HUD flutuante no topo do vídeo quando o usuário ajustar a largura
+        if self.hud_message and (time.time() - self.hud_time < 2.5):
+            hud_text = self.hud_message
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            f_scale = 0.52
+            thick = 2
+            (tw, th), _ = cv2.getTextSize(hud_text, font, f_scale, thick)
+            pad_x, pad_y = 16, 9
+            cx = self.video_width // 2
+            y_top = 20
+            bx1 = max(0, cx - (tw // 2) - pad_x)
+            by1 = y_top
+            bx2 = min(display_frame.shape[1], cx + (tw // 2) + pad_x)
+            by2 = min(display_frame.shape[0], y_top + th + pad_y * 2)
+
+            if bx2 > bx1 and by2 > by1:
+                hud_roi = display_frame[by1:by2, bx1:bx2]
+                hud_bg = np.zeros_like(hud_roi)
+                cv2.rectangle(hud_bg, (0, 0), (bx2 - bx1, by2 - by1), (25, 30, 42), -1)
+                cv2.addWeighted(hud_bg, 0.88, hud_roi, 0.12, 0, hud_roi)
+                cv2.rectangle(display_frame, (bx1, by1), (bx2, by2), (0, 215, 255), 2)
+                cv2.putText(display_frame, hud_text, (bx1 + pad_x, by1 + th + pad_y - 2),
+                            font, f_scale, (255, 255, 255), thick, cv2.LINE_AA)
 
         # Redimensiona mantendo proporção de 16:9
         scale = min(canvas_w / self.video_width, canvas_h / self.video_height)
@@ -1122,14 +1364,15 @@ class AppWindow:
             return
 
         self.temp_route_name = name.strip()
+        self.temp_corridor_width = 1.0
         self.drawing_mode = True
         self.current_draw_points = []
         self.mouse_video_pos = None
 
         self.draw_banner_frame.pack(fill=tk.X, before=self.canvas_frame, pady=(0, 6))
         self.draw_banner_lbl.config(
-            text=f"[{self.temp_route_name}] ➔ PASSO ÚNICO: Clique ou arraste no vídeo acompanhando a via, de onde os veículos VÊM [INÍCIO] até para onde eles VÃO [FIM].\n"
-                 f"Ao terminar, tecle Enter, clique com botão direito ou em 'Concluir Percurso'. Você poderá afinar ou engrossar a faixa depois no painel lateral."
+            text=f"[{self.temp_route_name}] ➔ PASSO ÚNICO: Clique ou arraste no vídeo acompanhando a via, do [INÍCIO] ao [FIM].\n"
+                 f"💡 Dica: Gire o Scroll do mouse ou aperte +/- para calibrar a largura da faixa em tempo real! Enter para salvar."
         )
         self.btn_finish_step.config(text="✓ Concluir e Salvar Percurso (Enter)", bg="#2a9d8f", fg="#ffffff")
 
@@ -1171,11 +1414,15 @@ class AppWindow:
             route_id=r_id,
             name=self.temp_route_name,
             path_points=cleaned_pts,
-            corridor_width=1.0,
+            corridor_width=self.temp_corridor_width,
             color=color,
         )
         self.route_engine.add_route(new_route)
+        self.selected_route_id = new_route.route_id
         ConfigManager.save_routes(self.route_engine.routes)
+
+        self.hud_message = f"✓ {new_route.name} criada! Role o Scroll ↕ ou use +/- para afinar/alargar."
+        self.hud_time = time.time()
 
         self._cancel_drawing()
         self._refresh_route_cards()
@@ -1203,12 +1450,16 @@ class AppWindow:
         return (vx, vy)
 
     def _on_canvas_click(self, event):
+        pt = self._canvas_to_video_coords(event.x, event.y)
+
         if not self.drawing_mode:
+            # Identifica se clicou em alguma rota existente para ativá-la
+            target = self._find_target_route_at_pos(pt[0], pt[1])
+            if target is not None:
+                self._select_route(target.route_id)
             return
 
-        pt = self._canvas_to_video_coords(event.x, event.y)
         self.current_draw_points.append(pt)
-
         if self.last_frame_bgr is not None:
             self._render_frame(self.last_frame_bgr, [])
 
@@ -1229,18 +1480,17 @@ class AppWindow:
             self._render_frame(self.last_frame_bgr, [])
 
     def _on_canvas_motion(self, event):
-        if not self.drawing_mode:
-            return
-
         pt = self._canvas_to_video_coords(event.x, event.y)
         self.mouse_video_pos = pt
 
-        if self.current_draw_points and self.last_frame_bgr is not None:
+        if self.drawing_mode and self.current_draw_points and self.last_frame_bgr is not None:
             self._render_frame(self.last_frame_bgr, [])
 
     def _delete_route(self, route_id):
         if messagebox.askyesno("Excluir Percurso", "Tem certeza que deseja remover este percurso?"):
             self.route_engine.remove_route(route_id)
+            if self.selected_route_id == route_id:
+                self.selected_route_id = self.route_engine.routes[0].route_id if self.route_engine.routes else None
             ConfigManager.save_routes(self.route_engine.routes)
             self._refresh_route_cards()
             if self.last_frame_bgr is not None:
@@ -1249,6 +1499,7 @@ class AppWindow:
     def _clear_all_routes(self):
         if messagebox.askyesno("Limpar Percursos", "Deseja remover todos os percursos configurados?"):
             self.route_engine.clear_routes()
+            self.selected_route_id = None
             ConfigManager.save_routes(self.route_engine.routes)
             self._refresh_route_cards()
             if self.last_frame_bgr is not None:
@@ -1279,7 +1530,11 @@ class AppWindow:
 
             self.route_engine.add_route(r1)
             self.route_engine.add_route(r2)
+            self.selected_route_id = 1
             ConfigManager.save_routes(self.route_engine.routes)
+
+            self.hud_message = "✓ Percursos padrão carregados! Role o Scroll do mouse para ajustar a largura."
+            self.hud_time = time.time()
 
             self._refresh_route_cards()
             if self.last_frame_bgr is not None:
